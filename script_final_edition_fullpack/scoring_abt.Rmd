@@ -1,0 +1,133 @@
+---
+title: "Разработка модели вероятности дефолта"
+output: html_document
+---
+
+```{r message=FALSE, warning=FALSE, paged.print=FALSE}
+#install.packages("scorecard")
+library(ggplot2)
+library(corrplot)
+library(MASS)
+library(caTools)
+library(data.table)
+library(Matrix)
+library(xgboost)
+library(party)
+library(ggthemes)
+library(ggmosaic) 
+library(InformationValue)
+library(Information)
+library(ClustOfVar)
+library(MLmetrics)
+#library(sparklyr)
+library(dplyr)
+library(ROCR)
+library(scorecard)
+library(ggpubr)
+library(DBI)
+library(RSQLite)
+```
+## Данные разработки
+
+### Загрузка данных
+
+Набор данных для разработки модели находится в CSV-файле
+```{r}
+
+abt_part1 <- as.data.frame(read.csv("abt_part1.csv"))
+abt_part2 <- as.data.frame(read.csv("abt_part2.csv"))
+abt_part3 <- as.data.frame(read.csv("abt_part3.csv"))
+
+sc <- dbConnect(RSQLite::SQLite(), ":memory:")
+dbWriteTable(sc, "abt_part1", abt_part1)
+dbWriteTable(sc, "abt_part2", abt_part2)
+dbWriteTable(sc, "abt_part3", abt_part3)
+abt <- dbGetQuery(sc, "SELECT * FROM abt_part1 as t1
+                              LEFT JOIN abt_part2 as t2
+                                ON t1.X = t2.X
+                                  LEFT JOIN abt_part3 as t3
+                                    ON t2.X = t3.X")
+dbDisconnect(sc)
+abt <- abt[, -c(1,80,158)]
+                    
+#head(abt)
+```
+
+
+### Преобразование данных
+
+приведение поля REPORT_DT к формату даты
+```{r}
+abt <- abt %>% mutate(REPORT_DT = as.Date(REPORT_DT))
+```
+
+Замена значений целевой переменной $-1$ на $0$
+```{r}
+abt$default_flg[abt$default_flg == -1]<-0
+```
+
+#### Список переменных в наборе данных
+```{r}
+Variable <- colnames(abt)
+Role <- c()
+for(i in length(Variable)) {
+  Role[i] <- NA
+}
+```
+
+Типы данных переменных
+```{r}
+Type <- sapply(abt, class)
+Role[Variable=="default_flg"] <- "Target"
+Role[Variable=="REPORT_DT"] <- "Drop"
+
+Type <- ifelse(Type == "integer" | Type == "numeric","interval",Type)
+Type <- ifelse(Type == "factor","character",Type)
+
+logicals = ifelse(Type == "logical", Variable, NA)
+logicals <- logicals[!is.na(logicals)]
+
+for(i in logicals){
+  abt[[i]] <- as.integer(abt[[i]])
+}
+
+Type <- ifelse(Type == "logical","interval", Type)
+```
+
+
+### Обработка пропущенных значений
+Количество переменных с пропущенными значениями
+```{r}
+na <- sapply(X = abt, FUN = function(x){sum(is.na(x))/nrow(abt)})
+Role <- ifelse(is.na(Role),"Input", Role)
+```
+
+
+Замена пропущенных значений интервальных переменных на 0
+```{r}
+numerics = ifelse(Type == "interval" & Role == "Input", Variable, NA)
+numerics <- numerics[!is.na(numerics)]
+
+for(i in numerics){
+  abt[[i]][is.na(abt[[i]])] <- 0
+}
+```
+
+Замена пропущенных значений номинальных переменных на "UNKNOWN"
+```{r}
+factors = ifelse(Type == "character" & Role == "Input", Variable, NA)
+factors <- factors[!is.na(factors)]
+
+for(i in factors){
+  abt[[i]] <- as.character(abt[[i]])
+}
+for(i in factors){
+  abt[[i]][(abt[[i]])==""] <- "UNKNOWN"
+}
+```
+
+
+#### сохранение преобразованных данных
+```{r}
+write.csv(abt, "scoring_abt.csv")
+```

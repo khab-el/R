@@ -1,0 +1,223 @@
+---
+title: "Мониторинг модели"
+output: 
+  html_notebook:
+    toc: true
+    toc_float: true
+---
+
+```{r include=FALSE}
+#install.packages("scorecard")
+library(ggplot2)
+library(corrplot)
+library(MASS)
+library(caTools)
+library(data.table)
+library(Matrix)
+library(xgboost)
+library(party)
+library(ggthemes)
+library(ggmosaic) 
+library(InformationValue)
+library(Information)
+library(ClustOfVar)
+library(MLmetrics)
+#library(sparklyr)
+library(dplyr)
+library(ROCR)
+library(scorecard)
+library(ggpubr)
+
+#Набор данных для разработки модели находится в CSV-файле
+
+scoring_model  <- as.data.frame(read.csv("scoring_model.csv"))[,-1]
+tree <- get(load("tree.Rdata"))
+
+scoring_model <- scoring_model %>% mutate(REPORT_DT = as.Date(REPORT_DT))
+
+Type <- sapply(scoring_model, class)
+Type <- ifelse(Type == "integer" | Type == "numeric","interval",Type)
+Type <- ifelse(Type == "factor","character",Type)
+Type <- ifelse(Type == "logical","interval", Type)
+```
+
+<!-- Row {.tabset .tabset-fade} -->
+<!-- ------------------------------------- -->
+
+### Кол-во переменных с пропущенными значениями
+```{r}
+scoring_model$REPORT_DT <- as.factor(scoring_model$REPORT_DT)
+na <- sapply(X = scoring_model, FUN = function(x){sum(x==0 | x == "UNKNOWN")/nrow(scoring_model)})
+hist(na,
+     main = "Распределение доли пропусков по перменным",
+     xlab = "Доля пропущенных значений",
+     ylab = "Количество переменных",
+     labels = TRUE)
+```
+
+### Кол-во уровней
+```{r}
+Variable <- colnames(scoring_model)
+factors = ifelse(Type == "character", Variable, NA)
+factors <- factors[!is.na(factors)]
+
+NLevels = sapply(scoring_model,nlevels)
+
+NLevels <- ifelse(Type == "character", NLevels, NA)
+NLevels <- NLevels[!is.na(NLevels)]
+
+barplot(NLevels, 
+  xlab = "Переменная", 
+  ylab = "Уровни",
+  main = "Количество уровней"  )
+```
+
+### Доля событий_дефолта
+```{r}
+
+ggplot(aes(x = default_flg), 
+       data = scoring_model) +
+  geom_bar(aes(y = ..count../ sum(..count..)), 
+           stat = "count", 
+           fill = c("#669933","#CC3333"), 
+           size = 1.5) +
+  xlab('Дефолт') +
+  ylab('Доля') +
+  theme(axis.title=element_text(size=12), 
+        legend.title = element_blank()) +
+  geom_text(aes(label = round((..count../ sum(..count..))*100,2), 
+                y= ..prop..), 
+            stat = "count")
+
+```
+
+### Доля дефолта в разрезе переменной Var211
+```{r}
+ggplot(data = scoring_model) +
+  geom_mosaic(aes(x = product(default_flg), fill = Var211),  size = 1) +
+  ggtitle("Распределение дефолтов") +
+  theme_fivethirtyeight() +
+  xlab('Отток') +
+  theme(axis.title=element_text(size=12),
+        legend.title = element_blank())
+```
+
+### График концентрации наблюдений по переменной Var73
+```{r}
+ggplot(scoring_model, aes(x=Var73, group=1)) +   
+  geom_bar(aes(y = ..count../ sum(..count..)), 
+           position = "dodge", 
+           stat="count", 
+           fill = "#669933")+
+  geom_point(aes(y = default_flg),
+             stat="summary", 
+             fun.y = "mean",
+             colour="#CC3333",
+             size=3
+  )+
+  geom_line(aes(y = default_flg),
+            stat="summary", 
+            fun.y = "mean",
+            colour="#CC3333",
+            size=1) +
+  ylab('Доля')
+```
+
+### Корреляционная матрица 
+```{r}
+Role <- c()
+for(i in length(Variable)) {
+  Role[i] <- NA
+}
+Role[Variable=="default_flg"] <- "Target"
+Role[Variable=="REPORT_DT"] <- "Drop"
+Role <- ifelse((na>0.2)==TRUE,"Drop", Role)
+Role <- ifelse(is.na(Role),"Input", Role)
+numerics = ifelse(Type == "interval" & Role == "Input", Variable, NA)
+numerics <- numerics[!is.na(numerics)]
+
+m <- cor(scoring_model[ ,numerics])
+corrplot(m, type = "upper", order="hclust", method = "square", outline = T, tl.col = "indianred4", tl.cex = 0.8, cl.cex = 1.5, diag=FALSE)
+```
+
+###Зависимость между переменными Var81 Var113
+```{r}
+#install.packages("mgcv")
+ggplot(aes(x = Var81, y = Var113), data = scoring_model) +
+  geom_point(alpha = 0.1) +
+  theme_fivethirtyeight() +
+  theme(axis.title=element_text(size=12)) +
+  stat_smooth()
+```
+
+### Иерархическая_кластеризация
+```{r}
+clust_tree <- hclustvar(data.matrix(scoring_model[,numerics]))
+plot(clust_tree)
+```
+
+### Распределение событий по отчетным датам
+```{r}
+ggplot(scoring_model, aes(x=REPORT_DT)) +   
+  geom_bar(aes(y = default_flg),
+           position = "dodge", 
+           stat="summary", 
+           fun.y = "mean",
+           fill="#CC3333") +
+  ggtitle("Train") +
+  xlab('Отчётная дата') +
+  ylab('Доля дефолта')
+```
+
+### WOE для Var6
+```{r}
+
+factors = ifelse(Type == "character" & Role == "Input", Variable, NA)
+factors <- factors[!is.na(factors)]
+inputs = c(numerics,factors)
+scoring_model$REPORT_DT <- as.Date(scoring_model$REPORT_DT)
+
+abt_train <- scoring_model %>% filter(REPORT_DT <= "2017-01-31")
+abt_test <- scoring_model %>% filter(REPORT_DT > "2017-01-31")
+abt_IVCheck <- CheckInputs(train=abt_train[,c(inputs,"default_flg")], valid=abt_test[,c(inputs,"default_flg")], trt=NULL, y="default_flg")
+abt_train <- abt_IVCheck[[1]]
+abt_test <- abt_IVCheck[[2]]
+
+IV <- create_infotables(data=abt_train, 
+                        valid=abt_test,
+                        y="default_flg",
+                        parallel=FALSE)
+plot_infotables(IV, "Var6", show_values=TRUE)
+
+```
+
+### Дерево
+```{r}
+
+plot(tree)
+
+```
+
+### TODO K-S ROC кривые
+```{r}
+a <- perf_eva(scoring_model$default_flg, scoring_model$Score , title = "Validation", groupnum = 20,
+        type = c("ks","roc"), show_plot = TRUE, seed = 186)
+```
+
+### Лифт Test
+```{r}
+tree_pred_abt <- prediction(as.vector(scoring_model$Score), scoring_model$default_flg)
+tree_perf_test_lift <- performance(tree_pred_abt,"lift","rpp")
+plot(tree_perf_test_lift, main="lift curve", colorize=F)  
+```
+
+<!-- ###Gini, KS, Lift -->
+<!-- ```{r} -->
+<!-- tree_validation = as.data.frame(c("Validation")) -->
+<!-- colnames(tree_validation) <- "Data" -->
+<!-- tree_validation$Gini = c(Gini(scoring_model$Score, scoring_model$default_flg)) -->
+<!-- tree_validation$KS = c(KS_Stat(scoring_model$Score, scoring_model$default_flg)) -->
+<!-- tree_validation$LiftAUC = c(LiftAUC(scoring_model$Score, scoring_model$default_flg)) -->
+
+<!-- tree_validation   -->
+<!-- ``` -->

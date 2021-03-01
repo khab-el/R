@@ -1,0 +1,596 @@
+---
+title: "Разработка модели вероятности дефолта"
+output: html_notebook
+---
+
+В данной рабочей тетради описан процесс разработки скоринговой карты
+
+```{r message=FALSE, warning=FALSE, paged.print=FALSE}
+#install.packages("scorecard")
+library(ggplot2)
+library(corrplot)
+library(MASS)
+library(caTools)
+library(data.table)
+library(Matrix)
+library(xgboost)
+library(party)
+library(ggthemes)
+library(ggmosaic) 
+library(InformationValue)
+library(Information)
+library(ClustOfVar)
+library(MLmetrics)
+#library(sparklyr)
+library(dplyr)
+library(ROCR)
+library(scorecard)
+library(ggpubr)
+```
+## Данные разработки
+
+### Загрузка данных
+
+Набор данных для разработки модели находится в CSV-файле
+```{r}
+abt <- as.data.frame(read.csv("abt_default3.csv", header=TRUE, sep="\t"))
+head(abt)
+```
+
+
+### Первичный анализ и преобразование данных
+
+Количество наблюдений
+```{r}
+abt <- abt %>% mutate(REPORT_DT = as.Date(REPORT_DT))
+abt %>% dplyr::group_by(REPORT_DT) %>%
+                dplyr::summarise(cnt = n())
+
+```
+
+Значения целевой переменной
+```{r}
+as.data.frame(unique(abt$default_flg))
+```
+
+Замена значений целевой переменной $-1$ на $0$
+```{r}
+abt$default_flg[abt$default_flg == -1]<-0
+as.data.frame(unique(abt$default_flg))
+```
+
+#### Список переменных в наборе данных
+```{r}
+abt_meta <- as.data.frame(colnames(abt))
+colnames(abt_meta) <- "Variable"
+abt_meta$Variable <- as.character(abt_meta$Variable)
+abt_meta$Description <- paste("Переменная ", abt_meta$Variable)
+abt_meta$Role <- NA
+```
+
+Типы данных переменных
+```{r}
+abt$REPORT_DT <- as.Date(abt$REPORT_DT)
+
+abt_meta$Type <- sapply(abt, class)
+
+
+abt_meta$Role[abt_meta$Variable=="default_flg"] <- "Target"
+abt_meta$Role[abt_meta$Variable=="REPORT_DT"] <- "Drop"
+
+#head(abt)
+
+
+
+abt_meta$Type <- ifelse(abt_meta$Type == "integer" | abt_meta$Type == "numeric","interval",abt_meta$Type)
+abt_meta$Type <- ifelse(abt_meta$Type == "factor","character",abt_meta$Type)
+
+logicals = abt_meta %>% filter(Type == "logical") %>% dplyr::select(Variable)
+
+for(i in logicals$Variable){
+  abt[[i]] <- as.integer(abt[[i]])
+}
+
+abt_meta$Type <- ifelse(abt_meta$Type == "logical","interval",abt_meta$Type)
+
+abt_meta %>% group_by(Type) %>% summarise(cnt=n())
+```
+Переменные
+```{r}
+abt_meta
+```
+
+### Обработка пропущенных значений
+Количество переменных с пропущенными значениями
+```{r}
+abt_meta$na <- sapply(X = abt, FUN = function(x){sum(is.na(x))/nrow(abt)})
+
+hist(abt_meta$na,
+     main = "Распределение доли пропусков по перменным",
+     xlab = "Доля пропущенных значений",
+     ylab = "Количество переменных",
+     labels = TRUE)
+```
+
+Исключение переменных с долей пропусков $> 20\%$
+```{r}
+abt_meta$Role <- ifelse((abt_meta$na>0.2)==TRUE,"Drop",abt_meta$Role)
+abt_meta$Role <- ifelse(is.na(abt_meta$Role),"Input",abt_meta$Role)
+```
+
+Переменные после исключения
+```{r}
+abt_meta %>% filter(Role == "Input") %>% group_by(Type) %>% summarise(cnt=n())
+abt_meta %>% filter(Role == "Input")
+```
+
+Замена пропущенных значений интервальных переменных на 0
+```{r}
+impute_med <- function(x){ifelse(is.na(x), median(x, na.rm = TRUE), x)}
+impute_zero <- function(x){ifelse(is.na(x), 0, x)}
+
+numerics = abt_meta %>% filter(Type == "interval" & Role == "Input") %>% dplyr::select(Variable)
+
+for(i in numerics$Variable){
+  abt[[i]][is.na(abt[[i]])] <- 0
+}
+```
+
+Замена пропущенных значений номинальных переменных на "UNKNOWN"
+```{r}
+factors = abt_meta %>% filter(Type == "character" & Role == "Input") %>% dplyr::select(Variable)
+
+for(i in factors$Variable){
+  #abt[[i]][is.na(abt[[i]])] <- "UNKNOWN"
+  abt[[i]] <- as.character(abt[[i]])
+}
+for(i in factors$Variable){
+  abt[[i]][(abt[[i]])==""] <- "UNKNOWN"
+}
+
+inputs = (abt_meta %>% filter(Role == "Input"))$Variable
+
+head(abt[,as.character(inputs)])
+
+factors = as.character((abt_meta %>% filter(Type == "character" & Role == "Input")) $Variable)
+```
+
+### Исключение номинальных факторов с большим числом уровней
+Количество уровней по номинальным факторам
+```{r}
+factors = abt_meta %>% filter(Type == "character") %>% dplyr::select(Variable)
+
+for(i in factors$Variable){
+  abt[[i]] <- as.factor(abt[[i]])
+}
+
+abt_meta$NLevels = sapply(abt,nlevels)
+
+ggplot(data = (abt_meta %>% filter(Type == "character" & Role == "Input")), 
+       aes(x = Variable, y = NLevels, fill = Variable)) +
+  geom_bar(stat = "identity") +
+  geom_text(aes(label=NLevels)) +
+  xlab("Переменная") +
+  ylab("Уровни") +
+  ggtitle("Количество уровней") + 
+  theme_fivethirtyeight() +
+  theme(legend.position = "none", axis.title=element_text(size=12), 
+        axis.text.x = element_text(angle = 50))
+
+```
+
+Исключение переменных с числом уровней $>50$
+```{r}
+abt_meta$Role <- ifelse((abt_meta$NLevels>50)==TRUE,"Drop",abt_meta$Role)
+```
+
+#### Список отобранных переменных
+```{r}
+factors = as.character((abt_meta %>% filter(Type == "character" & Role == "Input")) $Variable)
+numerics = as.character((abt_meta %>% filter(Type == "interval" & Role == "Input")) $Variable)
+inputs = c(numerics,factors)
+
+#inputs
+abt_meta %>% filter(Type %in% c("character", "interval") & Role == "Input")
+```
+
+### Уровень дефолта
+
+Доля событий дефолта
+```{r}
+ggplot(aes(x = default_flg), 
+       data = abt) +
+  geom_bar(aes(y = ..count../ sum(..count..)), 
+           stat = "count", 
+           fill = c("#669933","#CC3333"), 
+           size = 1.5) +
+  xlab('Дефолт') +
+  ylab('Доля') +
+  theme(axis.title=element_text(size=12), 
+        legend.title = element_blank()) +
+  geom_text(aes(label = round((..count../ sum(..count..))*100,2), 
+                y= ..prop..), 
+            stat = "count")
+```
+
+Доля дефолта в разрезе переменной Var196
+```{r}
+ggplot(data = abt) +
+  geom_mosaic(aes(x = product(default_flg), fill = Var196),  size = 1) +
+  ggtitle("Распределение дефолтов") +
+  theme_fivethirtyeight() +
+  xlab('Отток') +
+  theme(axis.title=element_text(size=12),
+        legend.title = element_blank())
+```
+
+График концентрации наблюдений по переменной Var196
+```{r}
+ggplot(abt, aes(x=Var196, group=1)) +   
+  geom_bar(aes(y = ..count../ sum(..count..)), 
+           position = "dodge", 
+           stat="count", 
+           fill = "#669933")+
+  geom_point(aes(y = default_flg),
+             stat="summary", 
+             fun.y = "mean",
+             colour="#CC3333",
+             size=3
+  )+
+  geom_line(aes(y = default_flg),
+            stat="summary", 
+            fun.y = "mean",
+            colour="#CC3333",
+            size=1) +
+  ylab('Доля')
+```
+
+
+## Разработка моделей
+### Отбор факторов
+
+Корреляционная матрица по интервальным переменным
+```{r}
+m <- cor(abt[ ,numerics])
+corrplot(m, type = "upper", order="hclust", method = "square", outline = T, tl.col = "indianred4", tl.cex = 0.8, cl.cex = 1.5, diag=FALSE)
+```
+
+Зависимость между переменными Var133 Var153
+```{r}
+#install.packages("mgcv")
+ggplot(aes(x = Var133, y = Var153), data = abt) +
+  geom_point(alpha = 0.1) +
+  theme_fivethirtyeight() +
+  theme(axis.title=element_text(size=12)) +
+  stat_smooth()
+```
+
+Кластеризация переменных
+
+Иерархическая кластеризация
+```{r}
+clust_tree <- hclustvar(data.matrix(abt[,numerics]))
+plot(clust_tree)
+```
+
+Отбор переменных по высоте в иерархии
+```{r}
+nvars <- length(clust_tree[clust_tree$height<0.7])
+part_init<-cutreevar(clust_tree,nvars)$cluster
+```
+
+k-means кластеризация
+```{r}
+clust_kmeans <- kmeansvar(X.quanti=data.matrix(abt[,numerics]),init=part_init)
+
+clusters <- cbind.data.frame(melt(clust_kmeans$cluster), row.names(melt(clust_kmeans$cluster)))
+names(clusters) <- c("Cluster", "Variable")
+```
+
+Кластеры переменных
+```{r warning=FALSE}
+clusters
+abt_meta <- abt_meta %>% left_join(clusters, by="Variable")
+```
+
+### Разделение на обучающую и тестовую выборки
+Распределение событий по отчетным датам
+```{r}
+ggplot(abt, aes(x=REPORT_DT)) +   
+  geom_bar(aes(y = default_flg),
+           position = "dodge", 
+           stat="summary", 
+           fun.y = "mean",
+           fill="#CC3333") +
+  ggtitle("Train") +
+  xlab('Отчётная дата') +
+  ylab('Доля дефолта')
+```
+
+Train - REPORT_DT $\leq$ "2017-01-31", Test - REPORT_DT $>$ "2017-01-31"
+```{r}
+abt_train <- abt %>% filter(REPORT_DT <= "2017-01-31")
+abt_test <- abt %>% filter(REPORT_DT > "2017-01-31")
+```
+
+### Расчет информационных критериев
+
+```{r}
+abt_IVCheck <- CheckInputs(train=abt_train[,c(inputs,"default_flg")], valid=abt_test[,c(inputs,"default_flg")], trt=NULL, y="default_flg")
+abt_train <- abt_IVCheck[[1]]
+abt_test <- abt_IVCheck[[2]]
+```
+
+Расчет IV
+```{r}
+IV <- create_infotables(data=abt_train, 
+                        valid=abt_test,
+                        y="default_flg",
+                        parallel=FALSE)
+```
+
+IV по переменной Var7
+```{r}
+plot_infotables(IV, "Var7", show_values=TRUE)
+```
+
+Добавление IV в метаданные ABT
+```{r}
+abt_meta <- abt_meta %>% left_join(IV$Summary, by="Variable")
+```
+
+Расчет индекса Gini
+```{r warning=FALSE}
+gini <- apply(X=abt_train, MARGIN=2, FUN=function(x) abs(Gini(x, abt_train$default_flg) )) 
+GiniIndex = as.data.frame(names(gini))
+colnames(GiniIndex) <- "Variable"
+GiniIndex$GiniIndex <- gini
+abt_meta <- abt_meta %>% left_join(GiniIndex, by="Variable")
+```
+
+#### Короткий список переменных
+```{r}
+abt_meta %>% filter(Role == "Input") %>% arrange(Cluster, -GiniIndex)
+```
+
+Отбор интервальных признаков по мультиколлинеарности по IV $>0.01$
+```{r}
+select_clust <- abt_meta %>% 
+  filter(!is.na(Cluster)) %>% 
+  arrange(Cluster)%>% dplyr::select(Cluster, Variable, AdjIV, GiniIndex)
+select_clust$Rank <- stats::ave(-select_clust$AdjIV, select_clust$Cluster, FUN=rank)  
+select_clust <- select_clust %>% filter(Rank==1 & AdjIV>0.01)
+select_clust$input <- 1
+select_clust
+abt_meta$Role <- ifelse(!(abt_meta$Variable %in% select_clust$Variable) & abt_meta$Type == "interval","Drop",abt_meta$Role)
+```
+
+Отбор номинальных признаков по Gini $>0.03$
+```{r}
+select_factors <- abt_meta %>% 
+  filter(Role == "Input" & Type == "character" & GiniIndex > 0.03) %>% 
+  dplyr::select(Variable, GiniIndex)
+select_factors$input <- 1
+select_factors  
+abt_meta$Role <- ifelse(!(abt_meta$Variable %in% select_factors$Variable) & abt_meta$Type == "character","Drop",abt_meta$Role)
+```
+
+Проверка совпадения уровней факторов на train test
+
+Переменные с несовпадающими множествами уровней факторов
+```{r}
+for(i in select_factors$Variable){
+  abt_train[[i]] <- as.factor(abt_train[[i]])
+  abt_test[[i]] <- as.factor(abt_test[[i]])
+}  
+
+ckeck_levels <- abt_meta %>% 
+  filter(Role=="Input" & Type == "character") %>% 
+  dplyr::select(Variable)
+ckeck_levels$Train <- as.character(sapply(abt_train[,as.character(ckeck_levels$Variable)],levels))
+ckeck_levels$Test <- as.character(sapply(abt_test[,as.character(ckeck_levels$Variable)],levels))
+
+ckeck_levels %>% filter(Train != Test)
+```
+
+Для упрощения исключение переменных с несовпадающим уровнем факторов 
+```{r}
+exlude = (ckeck_levels %>% filter(Train != Test))$Variable
+abt_meta$Role <- ifelse(abt_meta$Variable %in% exlude,"Drop",abt_meta$Role)
+```
+
+#### Короткий список переменных
+```{r}
+abt_meta %>% filter(Role=="Input")
+inputs <- as.character((abt_meta %>% filter(Role=="Input")) $Variable)
+```
+
+Обновление Train Test для обучения моделей  
+```{r}
+#abt_train <- abt_train %>% select("default_flg")
+abt_train <- abt_train %>% dplyr::select(c(inputs, "default_flg"))
+abt_test <- abt_test %>% dplyr::select(c(inputs, "default_flg"))
+```
+
+
+
+### Построение моделей
+#### Логистическая регрессия
+```{r warning=FALSE}
+glm_model <- glm (default_flg ~ ., data = abt_train, family = binomial(link='logit'))
+
+glm_predict_train <- predict(glm_model, type = 'response')
+glm_predict_test <- predict(glm_model, newdata=abt_test, type = 'response')
+
+glm_pred_test <- prediction(glm_predict_test, abt_test$default_flg)
+```
+K-S ROC кривые Test
+```{r}
+perf_eva(abt_test$default_flg, glm_predict_test, title = "Test", groupnum = 20, 
+         type = c("ks","roc"), show_plot = TRUE, seed = 186)$pic
+```
+
+Лифт Test
+```{r}
+glm_perf_test_lift <- performance(glm_pred_test,"lift","rpp")  
+plot(glm_perf_test_lift, main="lift curve", colorize=F)  
+```
+
+Gini, K-S, Lift
+```{r}
+glm_validation = as.data.frame(c("Train", "Test"))  
+colnames(glm_validation) <- "Data"
+glm_validation$Gini = c(Gini(glm_predict_train, abt_train$default_flg),
+                        Gini(glm_predict_test, abt_test$default_flg))
+glm_validation$KS = c(KS_Stat(glm_predict_train, abt_train$default_flg),
+                      KS_Stat(glm_predict_test, abt_test$default_flg))
+glm_validation$LiftAUC = c(LiftAUC(glm_predict_train, abt_train$default_flg),
+                           LiftAUC(glm_predict_test, abt_test$default_flg))
+glm_validation
+```
+
+#### Дерево решений
+```{r}
+tree <- ctree(default_flg ~ ., data = abt_train)  
+plot(tree)
+
+tree_predict_train <- predict(tree, type = 'response')
+tree_predict_test <- as.vector(predict(tree, newdata=abt_test, type = 'response'))  
+
+
+tree_pred_test <- prediction(tree_predict_test, abt_test$default_flg)  
+```
+
+```{r}
+#TODO K-S ROC кривые Test
+perf_eva(abt_test$default_flg, tree_predict_test, title = "Test", groupnum = 20,
+        type = c("ks","roc"), show_plot = TRUE, seed = 186)$pic
+```
+
+Лифт Test
+```{r}
+tree_perf_test_lift <- performance(tree_pred_test,"lift","rpp")  
+plot(tree_perf_test_lift, main="lift curve", colorize=F)  
+```
+
+Gini, KS, Lift
+```{r}
+tree_validation = as.data.frame(c("Train", "Test"))  
+colnames(tree_validation) <- "Data"
+tree_validation$Gini = c(Gini(tree_predict_train, abt_train$default_flg),
+                         Gini(tree_predict_test, abt_test$default_flg))
+tree_validation$KS = c(KS_Stat(tree_predict_train, abt_train$default_flg),
+                       KS_Stat(tree_predict_test, abt_test$default_flg))
+tree_validation$LiftAUC = c(LiftAUC(tree_predict_train, abt_train$default_flg),
+                            LiftAUC(tree_predict_test, abt_test$default_flg))
+tree_validation  
+```
+
+#### XGBoost
+Дополнительное преобразование данных
+создание разряженной матрицы для номинальных признаков
+(One-hot encoding)
+```{r}
+abt_xgb <- sparse.model.matrix(default_flg~.-1, data = abt_train)
+output_xgb = abt_train[,"default_flg"] == 1
+```
+
+Построение модели XGBoost
+```{r}
+xgb_model <- xgboost(data = abt_xgb, output_xgb, nrounds = 10, objective = "binary:logistic")
+
+# Feature importance plot
+xgb_importance <- xgb.importance(feature_names = colnames(abt_xgb), model = xgb_model)
+xgb.plot.importance(importance_matrix = xgb_importance)
+
+abt_xgb_test = xgb.DMatrix(sparse.model.matrix(default_flg~.-1, data = abt_test))
+
+xgb_predict_train <- predict(xgb_model, newdata=abt_xgb,type = 'response')
+xgb_predict_test <- predict(xgb_model, newdata=abt_xgb_test, type = 'response')    
+
+
+xgb_pred_test <- prediction(xgb_predict_test, abt_test$default_flg)  
+```
+
+K-S ROC кривые Test
+```{r}
+perf_eva(abt_test$default_flg, xgb_predict_test, title = "Test", groupnum = 20, 
+         type = c("ks","roc"), show_plot = TRUE, seed = 186)$pic
+```
+
+
+Лифт Test
+```{r}
+xgb_perf_test_lift <- performance(xgb_pred_test,"lift","rpp")  
+plot(xgb_perf_test_lift, main="lift curve", colorize=F)  
+```
+
+Gini, KS, Lift
+```{r}
+xgb_validation = as.data.frame(c("Train", "Test"))  
+colnames(xgb_validation) <- "Data"
+xgb_validation$Gini = c(Gini(xgb_predict_train, abt_train$default_flg),
+                        Gini(xgb_predict_test, abt_test$default_flg))
+xgb_validation$KS = c(KS_Stat(xgb_predict_train, abt_train$default_flg),
+                      KS_Stat(xgb_predict_test, abt_test$default_flg))
+xgb_validation$LiftAUC = c(LiftAUC(xgb_predict_train, abt_train$default_flg),
+                           LiftAUC(xgb_predict_test, abt_test$default_flg))
+xgb_validation    
+```
+
+```{r}
+glm_validation$Model = "Logistic Regression"
+tree_validation$Model = "Decision Tree"
+xgb_validation$Model = "XGBoost"
+
+validation = rbind(glm_validation, tree_validation, xgb_validation)
+
+validation$GiniIndex =  100*validation$Gini
+```
+
+Сравнение моделей по Gini  
+```{r}
+validation %>% filter(Data=="Test") %>%
+  ggplot(aes(x=Model)) + 
+  geom_bar(aes(y=GiniIndex), stat = "identity", position = "dodge", fill="deepskyblue1") +
+  coord_flip() +
+  xlab("") +
+  ylab("") +
+  ggtitle("Gini")  
+```
+
+Сравнение моделей по Lift
+```{r}
+validation %>% filter(Data=="Test") %>%
+  ggplot(aes(x=Model)) + 
+  geom_bar(aes(y=LiftAUC), stat = "identity", position = "dodge", fill="deepskyblue1") +
+  coord_flip() +
+  xlab("") +
+  ylab("") +
+  ggtitle("Lift")  
+```
+
+
+PSI
+```{r}
+score<-list(train=as.data.frame(glm_predict_train),
+            test=as.data.frame(glm_predict_test))
+colnames(score$train) <- "prob"
+colnames(score$test) <- "prob"  
+perf_psi(score=score, x_limits = c(0,1), x_tick_break=0.1)
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

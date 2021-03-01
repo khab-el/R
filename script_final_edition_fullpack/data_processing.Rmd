@@ -1,0 +1,84 @@
+---
+title: "Разработка модели вероятности дефолта"
+output: html_document
+---
+
+```{r message=FALSE, warning=FALSE, paged.print=FALSE}
+#install.packages("scorecard")
+library(ggplot2)
+library(corrplot)
+library(MASS)
+library(caTools)
+library(data.table)
+library(Matrix)
+library(party)
+library(ggthemes)
+library(ggmosaic) 
+library(InformationValue)
+library(Information)
+library(ClustOfVar)
+library(MLmetrics)
+library(sparklyr)
+library(dplyr)
+library(DBI)
+library(RSQLite)
+```
+## Данные разработки
+
+### Загрузка данных
+
+Набор данных для разработки модели находится в CSV-файле
+```{r}
+abt_part1 <- as.data.frame(read.csv("abt_part1.csv"))
+abt_part2 <- as.data.frame(read.csv("abt_part2.csv"))
+abt_part3 <- as.data.frame(read.csv("abt_part3.csv"))
+```
+
+параметры
+```{r}
+max_report_dt <- "2017-03-31"
+```
+
+
+```{r}
+sc <- dbConnect(RSQLite::SQLite(), ":memory:")
+dbWriteTable(sc, "abt_part1", abt_part1)
+dbWriteTable(sc, "abt_part2", abt_part2)
+dbWriteTable(sc, "abt_part3", abt_part3)
+abt <- dbGetQuery(sc, "SELECT
+                          case when Var6 isNULL then 0 else Var6 end Var6,
+                          case when Var7 isNULL then 0 else Var7 end Var7,
+                          case when Var13 isNULL then 0 else Var13 end Var13,
+                          case when Var73 isNULL then 0 else Var73 end Var73,
+                          case when Var74 isNULL then 0 else Var74 end Var74,
+                          case when Var81 isNULL then 0 else Var81 end Var81,
+                          case when Var113 isNULL then 0 else Var113 end Var113,
+                          case when Var125 isNULL then 0 else Var125 end Var125,
+                          case when Var140 isNULL then 0 else Var140 end Var140,
+                          case when Var194 == '' then 'UNKNOWN' else Var194 end Var194,
+                          case when Var201 == '' then 'UNKNOWN' else Var201 end Var201,
+                          case when Var206 == '' then 'UNKNOWN' else Var206 end Var206,
+                          case when Var211 == '' then 'UNKNOWN' else Var211 end Var211,
+                          case when Var218 == '' then 'UNKNOWN' else Var218 end Var218,
+                          case when Var225 == '' then 'UNKNOWN' else Var225 end Var225,
+                          case when Var229 == '' then 'UNKNOWN' else Var229 end Var229,
+                          CASE WHEN default_flg == -1 THEN 0 ELSE 1 END default_flg,
+                          REPORT_DT
+                       FROM abt_part1 as t1
+                        LEFT JOIN abt_part2 as t2
+                         ON t1.X = t2.X
+                          LEFT JOIN abt_part3 as t3
+                           ON t2.X = t3.X
+                       where REPORT_DT <= '2017-03-31'")
+
+
+                    
+dbWriteTable(sc, "abt", abt, overwrite = T)
+dbDisconnect(sc)
+```
+
+
+Сохранение данных 
+```{r}
+write.csv(abt, "train_abt.csv")
+```

@@ -1,0 +1,72 @@
+---
+title: "Разработка модели вероятности дефолта"
+output: html_document
+---
+
+```{r message=FALSE, warning=FALSE, paged.print=FALSE}
+#install.packages("scorecard")
+library(ggplot2)
+library(corrplot)
+library(MASS)
+library(caTools)
+library(data.table)
+library(Matrix)
+library(party)
+library(ggthemes)
+library(ggmosaic) 
+library(InformationValue)
+library(Information)
+library(ClustOfVar)
+library(MLmetrics)
+#library(sparklyr)
+library(dplyr)
+library(ROCR)
+library(scorecard)
+library(ggpubr)
+```
+## Данные разработки
+
+### Загрузка данных
+
+Набор данных для разработки модели находится в CSV-файле
+```{r}
+abt <- as.data.frame(read.csv("train_abt.csv"))[,-1]
+```
+
+параметры для MRM
+```{r}
+param_date <- "2017-01-31"
+```
+
+Train Test для обучения моделей  
+```{r}
+abt$REPORT_DT <- as.Date(abt$REPORT_DT)
+var <- colnames(abt)
+var <- var[var != "REPORT_DT"]
+
+abt %>% dplyr::filter(var[7] == 0)
+
+get(var[1])
+
+abt$var[[7]]
+
+
+var <- as.factor(var)
+levels(as.factor(var[1]))
+
+var[7] = abt[]
+
+abt_train <- abt %>% filter(REPORT_DT <= param_date) %>% select(var)
+abt_test <- abt %>% filter(REPORT_DT > param_date) %>% select(var)
+```
+
+#### Дерево решений
+```{r}
+tree <- ctree(default_flg ~ ., data = abt_train)  
+ 
+```
+
+сохранение данных
+```{r}
+save(tree, file = "tree.Rdata")
+```

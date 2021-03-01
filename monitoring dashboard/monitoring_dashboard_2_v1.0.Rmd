@@ -1,0 +1,245 @@
+---
+title: "Мониторинг модели"
+output: 
+  flexdashboard::flex_dashboard:
+    orientation: rows
+    vertical_layout: fill
+---
+
+```{r setup, include=FALSE}
+library(flexdashboard)
+library(ggplot2)
+library(corrplot)
+library(MASS)
+library(caTools)
+library(data.table)
+library(Matrix)
+library(xgboost)
+library(party)
+library(ggthemes)
+library(ggmosaic)
+library(Information)
+library(InformationValue)
+library(ClustOfVar)
+library(MLmetrics)
+library(dplyr)
+library(ROCR)
+library(scorecard)
+library(knitr)
+```
+
+## Загрузка данных
+
+Набор данных для разработки модели
+```{r}
+abt <-  as.data.frame(read.csv('abt_monitoring.csv'))[,-1]
+glm_pred <-  as.data.frame(read.csv('glm_predictions.csv'))
+colnames(glm_pred) <- c("ID", "prob")
+head(abt)
+```
+
+## Первичный анализ и преобразование данных
+
+Количество наблюдений 
+```{r}
+abt <- abt %>% mutate(REPORT_DT = as.Date(REPORT_DT))
+glm_pred$REPORT_DT <- abt$REPORT_DT
+
+fact_pred <- abt %>% select(churn)
+fact_pred$prob <- glm_pred$prob
+fact_pred$REPORT_DT <- abt$REPORT_DT
+
+abt %>% dplyr::group_by(REPORT_DT) %>%
+                dplyr::summarise(cnt = n())
+
+
+```
+
+### Разделение на обучающую и тестовую выборки
+Распределение событий по отчетным датам
+```{r}
+ggplot(abt, aes(x=REPORT_DT)) +   
+  geom_bar(aes(y = churn),
+           position = "dodge", 
+           stat="summary", 
+           fun.y = "mean",
+           fill="#CC3333") +
+  ggtitle("Train") +
+  xlab('Отчётная дата') +
+  ylab('Доля дефолта')
+```
+
+Train - REPORT_DT <= "2017-01-31"
+```{r}
+train_data=glm_pred %>% filter(REPORT_DT <= "2017-01-31") %>% select(prob)
+
+```
+
+
+```{r}
+validation <- data.frame(REPORT_DT = "1900-01-01",Metric = "none",Value = 0,stringsAsFactors=FALSE)
+
+unique(fact_pred$REPORT_DT)
+
+
+for (rep_dt in unique(fact_pred$REPORT_DT)) {
+    gini <- round(100*Gini((fact_pred %>% filter(REPORT_DT == rep_dt))$prob, (fact_pred %>% filter(REPORT_DT == rep_dt))$churn),2)
+    validation <- rbind(validation, c(as.character(as.Date(rep_dt)), "Gini", gini))
+
+    score <- list(train=train_data, test=fact_pred %>% filter(REPORT_DT == rep_dt) %>% select(prob))
+    perf <- perf_psi(score=score, x_limits = c(0,1), x_tick_break=0.1)
+    validation <- rbind(validation, c(as.character(as.Date(rep_dt)), "PSI", round(100*perf$psi$PSI,2)))
+}
+
+
+validation <- validation[-1,]
+validation$REPORT_DT <- as.Date(validation$REPORT_DT)
+
+```
+
+### Качечество модели
+```{r}
+gauge(82, min = 0, max = 100, symbol = '%', gaugeSectors(
+  success = c(80, 100), warning = c(40, 79), danger = c(0, 39)
+))
+
+```
+
+### Gini
+```{r}
+validation %>% filter(Metric == "Gini") %>% ggplot(aes(x=REPORT_DT)) + 
+  geom_bar(aes(y=Value), stat = "identity", position = "dodge", fill="deepskyblue1")+
+  xlab("") +
+  ylab("") +
+  ggtitle("Gini") 
+
+plotROC((fact_pred %>% filter(REPORT_DT == "2017-03-31"))$churn, (fact_pred %>% filter(REPORT_DT == "2017-03-31"))$prob) 
+```
+
+### PSI
+```{r}
+validation %>% filter(Metric == "PSI") %>% ggplot(aes(x=REPORT_DT)) + 
+  geom_bar(aes(y=Value), stat = "identity", position = "dodge", fill="deepskyblue1")+
+  xlab("") +
+  ylab("") +
+  ggtitle("PSI")
+
+score<-list(train=glm_pred %>% filter(REPORT_DT <= "2017-01-31") %>% select(prob),
+            test=glm_pred %>% filter(REPORT_DT == "2017-03-31") %>% select(prob))
+perf <- perf_psi(score=score, x_limits = c(0,1), x_tick_break=0.1)
+perf$pic$prob
+```
+
+### Уровень дефолта
+
+Доля событий дефолта
+```{r}
+ggplot(aes(x = churn), 
+       data = abt) +
+  geom_bar(aes(y = ..count../ sum(..count..)), 
+           stat = "count", 
+           fill = c("#669933","#CC3333"), 
+           size = 1.5) +
+  xlab('Дефолт') +
+  ylab('Доля') +
+  theme(axis.title=element_text(size=12), 
+        legend.title = element_blank()) +
+  geom_text(aes(label = round((..count../ sum(..count..))*100,2), 
+                y= ..prop..), 
+            stat = "count")
+```
+
+
+График концентрации наблюдений по переменной Var65
+```{r}
+# Variable <- colnames(abt[,-1])
+# Variable <- Variable[Variable != "churn" & Variable != "REPORT_DT"]
+
+ggplot(abt, aes(x= Var65, group=1)) +   
+  geom_bar(aes(y = ..count../ sum(..count..)), 
+           position = "dodge", 
+           stat="count", 
+           fill = "#669933")+
+  geom_point(aes(y = churn),
+             stat="summary", 
+             fun.y = "mean",
+             colour="#CC3333",
+             size=3
+  )+
+  geom_line(aes(y = churn),
+            stat="summary", 
+            fun.y = "mean",
+            colour="#CC3333",
+            size=1) +
+  ylab('Доля')
+
+
+```
+
+
+## Разработка моделей
+### Отбор факторов
+
+Корреляционная матрица по интервальным переменным
+```{r}
+Type <- sapply(abt[,-1], class)
+Variable <- colnames(abt[,-1])
+numerics <- ifelse(Type == "integer" | Type == "numeric", Variable, NA)
+numerics <- numerics[!is.na(numerics) & numerics != "churn"]
+m <- cor(abt[, numerics])
+corrplot(m, type = "upper", order="hclust", method = "square", outline = T, tl.col = "indianred4", tl.cex = 0.8, cl.cex = 1.5, diag=FALSE)
+```
+
+
+### Расчет информационных критериев
+
+```{r}
+abt$prob <- fact_pred$prob
+score<-list(train=abt %>% filter(REPORT_DT <= "2017-01-31"),
+            test=abt %>% filter(REPORT_DT == "2017-03-31"))
+abt_IVCheck <- CheckInputs(train=score$train, valid=score$test, trt=NULL, y="churn")
+abt_train <- abt_IVCheck[[1]]
+abt_test <- abt_IVCheck[[2]]
+```
+
+Расчет IV
+```{r}
+IV <- create_infotables(data=score$train, 
+                        valid=score$test,
+                        y="churn",
+                        parallel=FALSE)
+```
+
+IV по переменной Var7
+```{r}
+plot_infotables(IV, "Var13", show_values=TRUE)
+```
+
+```{r}
+x <- fact_pred %>% filter(churn == 0) %>% select(prob)
+y <- fact_pred %>% filter(churn == 1) %>% select(prob)
+
+plot(ecdf(x$prob) , xlim = range(c(x, y)), xlab = "скор-балл", ylab = "Доля", 
+     col = "red", main = "Критерий согласия Колмогорова-Смирнова") +
+plot(ecdf(y$prob), add = TRUE, lty = "dashed", col = "blue") +
+text(0.6, 0.9, "В дефолте", col = "red") +
+text(0.6, 0.8, "Не в дефолте", col = "blue") +
+  legend("topright",
+    legend=c("В дефолте","Не в дефолте"),
+    col=c("red", "blue"),
+    lwd=2,
+    )
+
+
+```
+
+```{r}
+x <- fact_pred %>% filter(churn == 0) %>% select(prob)
+y <- fact_pred %>% filter(churn == 1) %>% select(prob)
+
+plot(ecdf(x$prob) , xlim = range(c(x, y)), xlab = "скор-балл", ylab = "Доля", 
+     col = "red", main = "Критерий согласия Колмогорова-Смирнова") +
+legend(1,-1,c("В дефолте", "Не в дефолте"), pch = c(1,2), lty = c(1,2))
+
+
+```

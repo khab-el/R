@@ -1,0 +1,82 @@
+---
+title: "RWA calculation"
+output: 
+  flexdashboard::flex_dashboard:
+    #orientation: rows
+    vertical_layout: scroll
+runtime: shiny
+---
+
+Page 1 {data-navmenu="Menu A"}
+========================
+
+```{r message=FALSE, warning=FALSE, paged.print=FALSE}
+#install.packages("scorecard")
+library(ggplot2)
+library(corrplot)
+library(MASS)
+library(caTools)
+library(data.table)
+library(Matrix)
+library(xgboost)
+library(party)
+library(ggthemes)
+library(ggmosaic) 
+library(InformationValue)
+library(Information)
+library(ClustOfVar)
+library(MLmetrics)
+#library(sparklyr)
+library(dplyr)
+library(ROCR)
+library(scorecard)
+library(ggpubr)
+library(DBI)
+library(RSQLite)
+library(shiny)
+#library(r2excel)
+#install.packages("DT")
+```
+
+
+```{r}
+
+scoring_model  <- as.data.frame(read.csv("scoring_model.csv"))[,-1]
+
+```
+
+### Витрина с расчитанными резервами
+
+```{r}
+sc <- dbConnect(RSQLite::SQLite(), ":memory:")
+dbWriteTable(sc, "scoring_model", scoring_model)
+RWA <- dbGetQuery(sc, "SELECT t.*, Score*Var81 as RWA FROM scoring_model t ")
+dbDisconnect(sc)
+```
+
+
+### Запись результатов расчета
+
+```{r}
+write.csv(RWA, "RWA.csv")
+```
+
+Page 2 {data-navmenu="Menu A"}
+========================
+
+### Витрина отчетности
+```{r}
+ggplot(RWA, aes(Var229, RWA)) +
+  stat_summary(fun.y = mean, geom = "bar",
+                  color="blue", fill="white") 
+```
+
+### сумма резерва
+```{r}
+a <- RWA %>% group_by(Var229) %>% summarise(sum_RWA = sum(RWA))
+#knitr::kable(a)
+DT::datatable(a, options = list(
+  bPaginate = FALSE
+))
+```
+

@@ -1,0 +1,57 @@
+---
+title: "Разработка модели вероятности дефолта"
+output: html_document
+---
+
+```{r message=FALSE, warning=FALSE, paged.print=FALSE}
+#install.packages("scorecard")
+library(ggplot2)
+library(corrplot)
+library(MASS)
+library(caTools)
+library(data.table)
+library(Matrix)
+library(xgboost)
+library(party)
+library(ggthemes)
+library(ggmosaic) 
+library(InformationValue)
+library(Information)
+library(ClustOfVar)
+library(MLmetrics)
+#library(sparklyr)
+library(dplyr)
+library(ROCR)
+library(scorecard)
+library(ggpubr)
+```
+## Данные разработки
+
+### Загрузка данных
+
+Набор данных для скоринга модели находится в CSV-файле
+```{r}
+abt <- as.data.frame(read.csv("scoring_abt.csv"))[,-1]
+tree <- get(load("tree.Rdata"))
+```
+
+```{r}
+variable <- c("Var6", "Var7", "Var13", "Var73", "Var74", "Var81", "Var113", "Var125", "Var140", "Var194",
+              "Var201", "Var206", "Var211", "Var218", "Var225", "Var229", "default_flg", "REPORT_DT")
+abt <- abt %>% select(variable)
+```
+
+
+
+#### скор-балл
+```{r}
+
+tree_predict_abt <- as.vector(predict(tree, newdata=abt, type = 'response'))
+abt$Score =  tree_predict_abt
+
+```
+
+сохранение данных
+```{r}
+write.csv(abt, "scoring_model.csv")
+```
